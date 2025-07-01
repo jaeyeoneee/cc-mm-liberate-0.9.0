@@ -11,7 +11,7 @@ import torch
 #  from context.ckks_context import ckks_context
 from .context.ckks_context import ckks_context
 from .data_struct import data_struct
-from .encdec import decode, encode, rotate, conjugate
+from .encdec import decode, encode, rotate, conjugate, rotate_poly
 from .version import VERSION
 from .presets import types, errors
 from liberate.ntt import ntt_context
@@ -116,6 +116,8 @@ class ckks_engine:
             (int, data_struct): self.scalar_sub,
             (data_struct, int): self.sub_scalar
         }
+        
+        self._diag_cahce = {}
 
     # -------------------------------------------------------------------------------------------
     # Various pre-calculations.
@@ -312,17 +314,17 @@ class ckks_engine:
         return padding_result
 
     @errors.log_error
-    def encode(self, m, level: int = 0, padding=True) -> list[torch.Tensor]:
+    def encode(self, m, level: int = 0, padding=True, coeff=False) -> list[torch.Tensor]:
         """
             Encode a plain message m, using an encoding function.
             Note that the encoded plain text is pre-permuted to yield cyclic rotation.
         """
         deviation = self.deviations[level]
-        if padding:
+        if padding and not coeff:
             m = self.padding(m)
         encoded = [encode(m, scale=self.scale, rng=self.rng,
                           device=self.device0,
-                          deviation=deviation, norm=self.norm)]
+                          deviation=deviation, norm=self.norm, coeff=coeff)]
 
         pt_buffer = self.ksk_buffers[0][0][0]
         pt_buffer.copy_(encoded[-1])
@@ -331,13 +333,19 @@ class ckks_engine:
         return encoded
 
     @errors.log_error
-    def decode(self, m, level=0, is_real: bool = False) -> list:
+    def decode(self, m, level=0, is_real: bool = False, coeff = False) -> list:
         """
             Base prime is located at -1 of the RNS channels in GPU0.
             Assuming this is an orginary RNS deinclude_special.
         """
         correction = self.corrections[level]
-        decoded = decode(m[0].squeeze(), scale=self.scale, correction=correction, norm=self.norm)
+        decoded = decode(m[0].squeeze(), scale=self.scale, correction=correction, norm=self.norm, coeff=coeff)
+        
+        if coeff:
+            m = decoded.cpu().numpy()
+            # print(m)
+            return m
+        
         m = decoded[:self.ctx.N // 2].cpu().numpy()
         if is_real:
             m = m.real
@@ -593,6 +601,91 @@ class ckks_engine:
             raise errors.NotMatchType(origin=ct.origin, to=f"{types.origins['ct']} or {types.origins['ctt']}")
 
         return pt
+
+    # -------------------------------------------------------------------------------------------
+    # Slot to Coefficient conversion
+    # -------------------------------------------------------------------------------------------
+    def _build_U_matrix(self):
+        """
+        수정된 U 행렬 생성:
+         - 크기: (N, N/2)
+         - U[i, j] = exp(1j * π * (2*j + 1) * i / N)
+        여기서:
+          - i = 0,1,…,N-1
+          - j = 0,1,…,M-1  (M = N//2)
+          - ζ = e^{π i / N}
+        """
+        N = self.ctx.N
+        M = N // 2
+
+        # 행 인덱스: 0~N-1, 열 인덱스: 1,3,5,…,(2*M-1)
+        rows = torch.arange(N, dtype=torch.int64).view(N, 1)       # shape = (N, 1)
+        cols = (2 * torch.arange(M, dtype=torch.int64) + 1).view(1, M)  # shape = (1, M)
+
+        # expo[i,j] = (2*j + 1) * i mod (2N)  (사실 2N 모듈로 연산은 안전성 차원)
+        expo = (rows * cols) % (2 * N)  # shape = (N, M)
+
+        # U[i,j] = exp(1j * π * expo[i,j] / N)
+        U = torch.exp(1j * math.pi * expo.float() / float(N))  # torch complex tensor
+        return U
+
+    def get_U(self):
+        """
+        U 행렬을 한 번만 생성하고 캐시에 보관합니다.
+        """
+        if not hasattr(self, "_cached_U") or self._cached_U is None:
+            self._cached_U = self._build_U_matrix()  # shape = (N, M)
+        return self._cached_U
+
+    def _get_U_diag(self, offset: int) -> torch.Tensor:
+        """
+        U 행렬의 offset 번째 '대각선'을 추출하여 길이 N인 1차원 벡터로 반환합니다.
+        diag[i] = U[i, (i + offset) % M],  i = 0..N-1
+        """
+        U = self.get_U()  # shape = (N, M)
+        N = self.ctx.N
+        M = N // 2
+
+        # i = 0..N-1
+        rows = torch.arange(N, dtype=torch.int64)               # shape = (N,)
+        cols = (rows + offset) % M                              # shape = (N,)
+
+        return U[rows, cols]  # shape = (N,)
+
+    def slot_to_coeff(self, ct: "data_struct", gk, evk ,pk) -> data_struct:
+        """
+        수정된 Slot→Coeff 변환:
+         1) 먼저 U 행렬의 모든 대각선(diag)을 Plaintext로 미리 인코딩하여 캐시
+         2) offset = 0..M-1 순서로:
+            a) ct를 offset만큼 Galois 회전
+            b) 미리 인코딩한 diag_pts[offset]와 곱한 뒤 누적
+        """
+        N = self.ctx.N
+        M = N // 2
+
+        ct_result = None
+
+        for d in range(M):
+            diag = self._get_U_diag(d).cpu().numpy()
+            pt_diag = self.encorypt(diag[:M], pk)  # padding=False 권장
+
+            ct_rot = self.rotate_galois(ct, gk, d)      # rotate by +d
+            ct_mul = self.mult(ct_rot, pt_diag, evk)  
+            # print(ct_mul.level) 
+            # element-wise multiply
+            
+            if ct_result is None:
+                ct_result = ct_mul
+            else:
+                ct_result = self.add(ct_result, ct_mul)
+
+        # ct_result는 (Ciphertext) slot→coeff 결과
+        return ct_result
+
+    # --------------------------------------------------------------------------------------------
+    # Coefficient to slot conversion
+    # --------------------------------------------------------------------------------------------
+
 
     # -------------------------------------------------------------------------------------------
     # Key switching.
@@ -1177,6 +1270,34 @@ class ckks_engine:
         rotk = rotk._replace(origin=types.origins["rotk"] + f"{delta}")
         return rotk
 
+    def create_automorphism_key(self, sk: data_struct, exponent: int, a: list[torch.Tensor] = None):
+        """
+        secret key sk에 대해 m(X) -> m(X^(2*exponent+1)) 오토모피즘 키 생성.
+        이때 !2*exponenet + 1!이라는 것에 주의!!!
+        """
+        if sk.origin != types.origins["sk"]:
+            raise errors.NotMatchType(origin=sk.origin, to=types.origins["sk"])
+        
+        sk_new_data = [s.clone() for s in sk.data]
+        self.ntt.intt(sk_new_data)
+        sk_new_data = [rotate_poly(s, exponent) for s in sk_new_data]
+        self.ntt.ntt(sk_new_data)
+        sk_rotated = data_struct(
+            data=sk_new_data,
+            include_special=False,
+            ntt_state=True,
+            montgomery_state=True,
+            origin=types.origins["sk"],
+            level=0,
+            hash=self.hash,
+            version=self.version
+        )
+        
+        rotk = self.create_key_switching_key(sk_rotated, sk, a=a)
+        rotk = rotk._replace(origin=types.origins["rotk"] + f":{exponent}")
+        return rotk
+        
+    
     def rotate_single(self, ct: data_struct, rotk: data_struct) -> data_struct:
 
         if ct.origin != types.origins["ct"]:
@@ -1212,6 +1333,44 @@ class ckks_engine:
 
         rotated_ct = self.switch_key(rotated_ct_rotated_sk, rotk)
         return rotated_ct
+    
+    def apply_automorphism(self, ct: data_struct, rotk: data_struct) -> data_struct:
+        
+        if ct.origin != types.origins["ct"]:
+            raise errors.NotMatchType(origin=ct.origin, to=types.origins["ct"])
+        if types.origins["rotk"] not in rotk.origin:
+            raise errors.NotMatchType(origin=rotk.origin, to=types.origins["rotk"])
+        
+        
+        level            = ct.level
+        include_special  = ct.include_special
+        ntt_state        = ct.ntt_state
+        montgomery_state = ct.montgomery_state
+        origin = rotk.origin
+        exponent = int(origin.split(':')[-1])
+
+        rotated_data = [[rotate_poly(d, exponent) for d in ct_data] for ct_data in ct.data]
+
+
+        mult_type = -2 if include_special else -1
+        for ct_data in rotated_data:
+            self.ntt.make_unsigned(ct_data, level, mult_type)
+            self.ntt.reduce_2q(ct_data, level, mult_type)
+
+        tmp = data_struct(
+            data=rotated_data,
+            include_special=include_special,
+            ntt_state=ntt_state,
+            montgomery_state=montgomery_state,
+            origin=types.origins["ct"],
+            level=level,
+            hash=ct.hash,
+            version=ct.version
+        )
+
+        # 4) 키스위칭
+        return self.switch_key(tmp, rotk)
+        
 
     def create_galois_key(self, sk: data_struct) -> data_struct:
         if sk.origin != types.origins["sk"]:

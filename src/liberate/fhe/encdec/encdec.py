@@ -126,6 +126,10 @@ def inverse_permutation(p, verbose=False):
         print(f"The inverse of permutation\n{p}\nis\n{ip}.")
     return ip
 
+def bit_reverse_indices(N):
+    bits = int(np.log2(N))
+    return np.array([int(f"{i:0{bits}b}"[::-1], 2) for i in range(N)])
+
 
 # ---------------------------------------------------------------
 # Negacyclic fft.
@@ -244,7 +248,30 @@ def rotate(m, delta):
     rot_m.view(C, N).T[perm_folded] = (perm_sign * m).view(C, N).T
 
     return rot_m
+# -----------------------------------
+# automorphism m(X) -> m(X^(2*j+1))
+# -----------------------------------
+def rotate_poly(m: torch.Tensor, k: int) -> torch.tensor:
+    N = m.size(-1)
+    C = m.numel() // N
+    
+    towN = 2 * N
+    leap = k % towN
+    
+    perm = canon_permutation_torch(N, leap, device=m.device)
+    perm_folded = perm % N
+    perm_sign = (-1) ** (perm//N)
+    
+    rot_m = torch.zeros_like(m)
+    
+    view = m.view(C, N)
+    rot_view = rot_m.view(C,N)
+    
+    rot_view.T[perm_folded] = (perm_sign * view).T
+    
+    return rot_m
 
+# -----------------------------------------
 
 def conjugate(m):
     N = m.size(-1)
@@ -272,17 +299,26 @@ def conjugate(m):
 
 def encode(m, rng=None, scale=2 ** 40, deviation=1.0,
            device='cuda:0', norm='forward',
-           return_without_scaling=False):
+           return_without_scaling=False, coeff=False):
     N = len(m) * 2
     if (N, device) in perm_cache.keys():
         pre_perm, post_perm = perm_cache[(N, device)]
     else:
         pre_perm, post_perm = prepost_perms(N, device=device)
         perm_cache[(N, device)] = (pre_perm, post_perm)
+        
+    # print("m:", m)
+    mm = torch.from_numpy(np.array(m * deviation, dtype = np.float64)).to(device)  # check dtype m * deviation
+    # print("mm:", mm)
 
-    mm = torch.from_numpy(np.array(m * deviation)).to(device)  # check dtype m * deviation
+
+    if coeff:
+        # print("return:", rng.randround(mm * np.float64(scale)))
+        return rng.randround(mm * np.float64(scale))
+    
     mm = pre_permute(mm, pre_perm)
-
+    # print("mm:", mm)
+    
     if (N, device) in twister_cache.keys():
         twister = twister_cache[N, device]
     else:
@@ -298,14 +334,23 @@ def encode(m, rng=None, scale=2 ** 40, deviation=1.0,
 
 def decode(m, scale=2 ** 40,
            correction=1.0, norm='forward',
-           return_without_scaling=False):
+           return_without_scaling=False, coeff=False):
     N = len(m)
+    
+    if coeff:
+        mm = m / scale * correction
+        # mm = post_permute(mm, post_perm)
+        # print("post permute mm:", mm)
+        return mm
+
+    
     device = m.device.type + ':' + str(m.device.index)
     if (N, device) in perm_cache.keys():
         pre_perm, post_perm = perm_cache[(N, device)]
     else:
         pre_perm, post_perm = prepost_perms(N, device=device)
         perm_cache[(N, device)] = (pre_perm, post_perm)
+
 
     if (N, device) in skewer_cache.keys():
         skewer = skewer_cache[N, device]

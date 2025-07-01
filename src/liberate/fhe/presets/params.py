@@ -3,7 +3,7 @@ params = {
         "logN": 14,
         "num_special_primes": 1,
         "devices": [0],
-        "scale_bits": 40,
+        "scale_bits": 30,
         "num_scales": None,
     },
     "silver": {
