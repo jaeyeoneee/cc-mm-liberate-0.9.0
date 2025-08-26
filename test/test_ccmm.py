@@ -79,11 +79,23 @@ def test_tweak_np():
   assert np.allclose(expected, tweak_result, rtol=0)
   
 def test_rotate_with_cyclic_sign():
-  
+  """cuda, cpu 조심해서 할당하기!
+  """
   model = CCMM()
   
-  vector = np.arange(2**15)//10
+  shift =2
+  
+  vector = np.arange(2**14)//10
   encoded = model.engine.encode(vector, coeff=True)
   encrypted = model.engine.encrypt(encoded, model.pk)
+  encrypted = model.engine.cpu(encrypted)
   
+  rotated = model.rotate_with_cyclic_sign(encrypted, shift)
+  rotated = model.engine.cuda(rotated)
+  decrypted = model.engine.decrypt(rotated, model.sk)
+  decoded = model.engine.decode(decrypted, coeff=True)
+  
+  expected = model.rotate_with_cyclic_sign_np(vector, shift)
+  
+  assert np.allclose(decoded, expected, rtol=1e-5)
   

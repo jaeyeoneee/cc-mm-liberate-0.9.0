@@ -148,11 +148,47 @@ class CCMM:
         
     return np.vstack(result_blocks)
 
+  def normalize_unsinged(self, chunk: torch.Tensor, level, include_special):
+    mult_type = -2 if include_special else -1
+    self.engine.ntt.make_unsigned([chunk], level, mult_type)
+    self.engine.ntt.reduce_2q(    [chunk], level, mult_type)
+    return chunk
+
   def rotate_with_cyclic_sign(self, ct, shift):
     """
     multiply ct(X) polynomial by x^i
     """
-  
+    
+    r = shift // self.slot_size
+    s = shift % self.slot_size
+    
+    ct = self.engine.cuda(ct)
+    shifted_data = []
+    
+    for comp in ct.data:
+      shifted_comp = []
+      for chunk in comp:
+        rolled = torch.roll(chunk, shifts=shift, dims=-1)
+        if s != 0:
+          rolled[..., :s] *= -1
+        if (r % 2) == 1:
+          rolled *= -1
+        self.normalize_unsinged(chunk, ct.level, ct.include_special)
+        shifted_comp.append(rolled)
+      shifted_data.append(shifted_comp)
+    
+    return self.engine.cpu(data_struct(
+        data=shifted_data,
+        include_special=ct.include_special,
+        ntt_state=ct.ntt_state,
+        montgomery_state=ct.montgomery_state,
+        origin=ct.origin,
+        level=ct.level,
+        hash=ct.hash,
+        version=ct.version
+    ))
+        
+        
   def tweak(self):
     pass
   
