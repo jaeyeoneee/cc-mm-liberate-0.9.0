@@ -6,6 +6,10 @@ from liberate import fhe
 from liberate.fhe import presets
 from liberate.fhe.data_struct import data_struct
 
+"""
+기본적으로 암호문은 모두 cpu에 있다고 생각하기!
+"""
+
 class CCMM:
   
   def __init__(self):
@@ -148,12 +152,6 @@ class CCMM:
         
     return np.vstack(result_blocks)
 
-  def normalize_unsinged(self, chunk: torch.Tensor, level, include_special):
-    mult_type = -2 if include_special else -1
-    self.engine.ntt.make_unsigned([chunk], level, mult_type)
-    self.engine.ntt.reduce_2q(    [chunk], level, mult_type)
-    return chunk
-
   def rotate_with_cyclic_sign(self, ct, shift):
     """
     multiply ct(X) polynomial by x^i
@@ -165,6 +163,12 @@ class CCMM:
     ct = self.engine.cuda(ct)
     shifted_data = []
     
+    def normalize_unsigned(chunk: torch.Tensor, level, include_special):
+      mult_type = -2 if include_special else -1
+      self.engine.ntt.make_unsigned([chunk], level, mult_type)
+      self.engine.ntt.reduce_2q(    [chunk], level, mult_type)
+      return chunk
+    
     for comp in ct.data:
       shifted_comp = []
       for chunk in comp:
@@ -173,7 +177,7 @@ class CCMM:
           rolled[..., :s] *= -1
         if (r % 2) == 1:
           rolled *= -1
-        self.normalize_unsinged(chunk, ct.level, ct.include_special)
+        rolled = normalize_unsigned(rolled, ct.level, ct.include_special)
         shifted_comp.append(rolled)
       shifted_data.append(shifted_comp)
     
@@ -189,9 +193,38 @@ class CCMM:
     ))
         
         
-  def tweak(self):
-    pass
-  
+  def tweak(self, cts):
+    
+    n = len(cts)
+    
+    if n == 1:
+      return cts
+    
+    ct_p = [None] * n
+    ct_p[0] = cts[0]
+    
+    for l in range(0, int(np.log2(n))):
+      pow2 = 2**l
+      block = n // (2*pow2)
+      
+      aux_cts = [cts[(2*j+1)*block] for j in range(pow2)]
+      aux = self.tweak(aux_cts)
+    
+      for j in range(0, pow2):
+        shift_k = (self.slot_size // (2**l)) * j
+        ct_rot = self.rotate_with_cyclic_sign(aux[j], shift_k)
+        ct_rot = self.engine.cuda(ct_rot)
+        
+        ct_pj = self.engine.cuda(ct_p[j])
+        
+        ct_sub = self.engine.sub(ct_pj, ct_rot)
+        ct_add = self.engine.add(ct_pj, ct_rot)
+        
+        ct_p[j+pow2] = self.engine.cpu(ct_sub)
+        ct_p[j] = self.engine.cpu(ct_add)
+      
+    return ct_p
+
   def cmt(self):
     pass
   

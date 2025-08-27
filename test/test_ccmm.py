@@ -98,4 +98,22 @@ def test_rotate_with_cyclic_sign():
   expected = model.rotate_with_cyclic_sign_np(vector, shift)
   
   assert np.allclose(decoded, expected, rtol=1e-5)
+
+def test_tweak():
+  
+  model = CCMM()
+  
+  N = model.slot_size
+  matrix = np.random.rand(N, N) * 10
+  
+  tweak_np = model.tweak_np(matrix)
+  
+  encrypted = model.encode(matrix)
+  
+  tweak_liberate = model.tweak(encrypted)
+  
+  decrypted = model.decode(tweak_liberate)
+  
+  assert np.allclose(tweak_np, decrypted, rtol=1000)
+
   
