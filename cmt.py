@@ -65,6 +65,37 @@ def c_mt_np(matrix):
   
   return ct_out
 
+def mul_by_invN_mod(engine, ct):
+    # ct: data_struct (보통 NTT+Montgomery 상태)
+    N = engine.ctx.N
+    level = ct.level
+    include_special = ct.include_special
+    mult_type = -2 if include_special else -1
+
+    # 1) (선택) 몽고메리 해제해서 깔끔하게 처리
+    #    라이브러리 내에 from_montgomery가 없으면 make_unsigned/reduce_2q만으로도 괜찮은 경우가 많음
+    #    여기선 정규화만 먼저 해줄게
+    for comp in ct.data:
+        engine.ntt.make_unsigned(comp, level, mult_type)
+        engine.ntt.reduce_2q(    comp, level, mult_type)
+
+    # 2) 각 limb에 대해 q_i, invN_i를 구해 모듈러 곱
+    #    ct.data의 shape이 [2 components][num_limbs][N] 라는 가정
+    for comp in ct.data:                # c0, c1
+        for limb_idx, chunk in enumerate(comp):   # 각 q_i 잔여
+            q_i = engine.ctx.q[level+limb_idx]   # <- 네 엔진에서 q 접근 방법에 맞춰 수정
+            invN = pow(N, -1, int(q_i))
+            # invN = 1/N
+            # 텐서에 스칼라 모듈러 곱: (chunk * invN) % q_i
+            # dtype이 torch.int64라면 아래처럼:
+            chunk.mul_(invN)        # 곱
+            engine.ntt.reduce_2q([chunk], level, mult_type)  # mod q 정리
+
+    # 3) (선택) 필요 시 몽고메리로 복귀
+    #    보통 다음 연산이 기대하는 도메인/표시에 맞춰 플래그 유지
+    return ct
+
+
 def c_mt(engine, cts, pts_test = None, sk = None):
   
   N = len(cts)
@@ -74,42 +105,47 @@ def c_mt(engine, cts, pts_test = None, sk = None):
   
   # line 1: first tweak
   shifted = [polynomial_X_mult(engine, cts[i], i) for i in range(N)]
-  # shifted_test = np.vstack([rotate_with_cyclic_sign(pts_test[i], i) for i in range(N)])
+  shifted_test = np.vstack([rotate_with_cyclic_sign(pts_test[i], i) for i in range(N)])
   
   # for i in range(10):
-    # print("fhe line 1 -> shifted:", engine.decode(engine.decrypt(engine.cuda(shifted[i]), sk), coeff=True)[:20])
-    # print("np line 1 -> shifted:", shifted_test[i][:20])
+  #   print("fhe line 1 -> shifted:", engine.decode(engine.decrypt(engine.cuda(shifted[i]), sk), coeff=True)[:20])
+  #   print("np line 1 -> shifted:", shifted_test[i][:20])
 
   aux = tweak(engine, shifted)
-  # aux_test = tweak_np(shifted_test)
+  aux_test = tweak_np(shifted_test)
   
     
   # for i in range(10):
-    # print("fhe line 1 -> tweak:", engine.decode(engine.decrypt(engine.cuda(aux[i]), sk), coeff=True)[:20])
-    # print("np line 1 -> tweak:", aux_test[i][:20])  
+  #   print("fhe line 1 -> tweak:", engine.decode(engine.decrypt(engine.cuda(aux[i]), sk), coeff=True)[:20])
+  #   print("np line 1 -> tweak:", aux_test[i][:20])  
   
   # line 2 ~ 4: automorphism
   inv_N_np = 1/N
   # inv_n = pow(N, -1, reduce(operator.mul, engine.ctx.q, 1))
   aux_p = [None] * N
-  # aux_p_np = np.zeros_like(aux_test)
+  aux_p_np = np.zeros_like(aux_test)
   for j in range(N):
     # line 3: multiply N^-1 to aux
     index = 2*j+1
     inv_index = pow(index, -1, 2*N) // 2
     
     ct_temp = engine.cuda(aux[inv_index])
-    ct_scaled = engine.mult_scalar(ct_temp, inv_N_np)
-    # np_scaled = inv_N_np * aux_test[inv_index]
+    # print(inv_N_np)
+    ct_scaled = engine.mult_invN_coeff(ct_temp)
+    # ct_scaled = engine.mult_scalar(ct_temp, inv_N_np)
+    np_scaled = inv_N_np * aux_test[inv_index]
+
+    print("fhe line 3->", engine.decode(engine.decrypt(ct_scaled, sk), coeff=True)[:20])
+    print("np line 3->", np_scaled[:20])
     
     # line 4: automorphism
     auto_key = engine.create_automorphism_key(sk, j)
     ct_galois = engine.apply_automorphism(ct_scaled, auto_key)
     
     aux_p[j] = engine.cpu(ct_galois)
-    # aux_p_np[j] = automorphism_np(np_scaled, index)
+    aux_p_np[j] = automorphism_np(np_scaled, index)
 
-  # # print("line 2~4 -> aux_p:", aux_p)
+  # print("line 2~4 -> aux_p:", aux_p)
   # for i in range(10):
   #   print("fhe line 3->", engine.decode(engine.decrypt(engine.cuda(aux_p[i]), sk), coeff=True)[:20])
   #   print("np line 3->", aux_p_np[i][:20])
@@ -131,7 +167,7 @@ def c_mt(engine, cts, pts_test = None, sk = None):
     index_out = j % N
     
     ct_pp_mult_X = engine.cuda(polynomial_X_mult(engine, ct_pp[index], mult))
-    ct_pp_neg = engine.cpu(engine.negate(ct_pp_mult_X))
+    ct_pp_neg = engine.cpu(engine.negate_coeff(ct_pp_mult_X))
     
     ct_out[index_out] = ct_pp_neg
     # ct_out_np[index_out] = -1 * rotate_with_cyclic_sign(ct_pp_np[index], mult)
@@ -144,106 +180,54 @@ def c_mt(engine, cts, pts_test = None, sk = None):
   return ct_out
 
 if __name__ == "__main__":
-  # # numpy test for c-mt algorithm
-  # print("------ c_mt_np test----------")
-  # N = 2**14 # Ring dimension
-  # n = 2**14 # the number of ciphertexts
-  
-  # input = np.zeros((n, N))
-  # for i in range(n):
-  #   for j in range(N):
-  #     input[i][j] = j
-  
-  # # c_mt_rs = c_mt_np(input)
-  # # # print("input:", input)
-  # # # print("c_mt_rs:", c_mt_rs)
-  
   # liberate c-mt algorithm test
   # print("------ c_mt liberate fhe test ----------")
-  params = presets.params["bronze"]
-  # params["logN"] = 10
-  engine = fhe.ckks_engine(**params)
-  # engine = fhe.ckks_engine(logN= 13, buffer_bit_length = 62, scale_bits = 40, num_special_primes=1, verbose=True)
+  # params = presets.params["bronze"]
+  # engine = fhe.ckks_engine(**params)
+  engine = fhe.ckks_engine(logN= 13, buffer_bit_length = 62, scale_bits = 30, num_special_primes=1, verbose=True)
   sk = engine.create_secret_key()
   pk = engine.create_public_key(sk)
 
   N = engine.ctx.N
-  # Bronze 사이즈에 대해서 대략 41기가 정도 크기 필요 cpu ram    
   
-  cts = []
-  pts_test = [np.arange(N) % 10 for _ in range(N)]
-  # pts_test = np.load("test/plain_matrix.npy")
-  print("input[0]:", pts_test[0])
-  for i in range(N):
-    pts = engine.encode(pts_test[i], coeff=True)
-    ct = engine.encrypt(pts, pk)
-    cts.append(engine.cpu(ct))
-  
+  rng = np.random.default_rng(0)
+  plain = rng.random((N, N), dtype=np.float64)  # [0,1) 범위
+
   import time
-  
+
+  # 각 행을 계수 인코딩 → 암호화
   t0 = time.perf_counter()
-  
-  c_mt(engine, cts, pts_test, sk = sk)
-  
-  elapsed = time.perf_counter() - t0
-  
-  print(elapsed)
-  
-  # # automorphsim_test
-  # print("------ automorphism_np test -------")
-  # vec = np.array([1, 2, 3, 4])
-  # print("vec:", vec)
-  # k = 5
-  # print("k:", k)
-  # auto_rs = automorphism_np(vec, k)
-  # print("automorphism_np result:", auto_rs)
-  
-  # liberate automorphism test
-  # print("----------automorphism test liberate--------")
-  # params = presets.params["bronze"]
-  # engine = fhe.ckks_engine(**params)
+  cts = []
+  for i in range(N):
+      pt = engine.encode(plain[i], coeff=True)
+      ct = engine.encrypt(pt, pk)
+      cts.append(engine.cpu(ct))
+  t_enc = time.perf_counter() - t0
+  print(f"[enc] encoded+encrypted {N} rows in {t_enc:.2f}s")
 
-  # sk = engine.create_secret_key()
-  # pk = engine.create_public_key(sk)
+  # C-MT 실행
+  t0 = time.perf_counter()
+  ct_out = c_mt(engine, cts, plain,  sk=sk)  # pts_test는 없어도 됩니다
+  t_cmt = time.perf_counter() - t0
+  print(f"[c_mt] finished in {t_cmt:.2f}s")
 
-  # input = np.arange(engine.ctx.N)
-  # ct = engine.encrypt(engine.encode(input, coeff=True), pk)
-  
-  # rotk = engine.create_automorphism_key(sk, 2)
-  # rotated_ct = engine.apply_automorphism(ct, rotk)
-  
-  # print("decrypted rot X^3:", engine.decode(engine.decrypt(rotated_ct, sk), coeff=True)[:10])
-  # print("automorphism X^3 np:", automorphism_np(input, 5)[:10])
+  # 결과 복호화/디코드해서 행렬로 복원
+  t0 = time.perf_counter()
+  rec_rows = []
+  for j in range(N):
+      dec = engine.decrypt(engine.cuda(ct_out[j]), sk)
+      rec = engine.decode(dec, coeff=True)          # shape: (N,)
+      rec_rows.append(rec.astype(np.float64))
+  rec_mat = np.vstack(rec_rows)                     # shape: (N, N)
+  t_dec = time.perf_counter() - t0
+  print(f"[dec] decrypted+decoded in {t_dec:.2f}s")
 
-  #  Test for rotate in encdec.py
-
-  # # N = 16
-  # torch.manual_seed(0)
-  # vec_np = np.random.randint(-10, 10, size=N)
-  # vec_t = torch.tensor(vec_np, dtype=torch.int64)
-
-  # ks = []
-  # for i in range(1*N):
-  #   ks.append(i)
-  # results = []
-
-  # for k in ks:
-  #   rot_t = rotate_poly(vec_t, k)
-  #   rot_np_from_t = rot_t.numpy()
-  #   rot_np_gt = automorphism_np(vec_np, 2*k+1)
-  #   equal = np.array_equal(rot_np_from_t, rot_np_gt)
-  #   results.append({
-  #       'k': k,
-  #       'rotate_poly': rot_np_from_t.tolist(),
-  #       'automorphism_np': rot_np_gt.tolist(),
-  #       'match': equal
-  #   })
-  #   print(equal)
-  # # print(results)
+  # 정답과 비교 (Transpose)
+  target = plain.T
+  diff = rec_mat - target
+  mae = np.mean(np.abs(diff))
+  maxe = np.max(np.abs(diff))
+  print(f"[err] MAE={mae:.6e}, MAX={maxe:.6e}")
   
-  # #  modular test for c-mt algorithm line 8
-  # N = engine.ctx.N
-  # for j in range(1, N+1):
-  #   print(pow(N-j, 1, N))
-  
-  
+  print(f"original: {plain}")
+  print(f"cmt: {rec_mat}")

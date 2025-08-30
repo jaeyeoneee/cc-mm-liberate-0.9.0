@@ -2240,6 +2240,7 @@ class ckks_engine:
     def mult_scalar(self, ct, scalar, evk=None, relin=True):
         device_len = len(ct.data[0])
 
+        
         scaled_scalar = int(
             scalar * self.scale * np.sqrt(self.deviations[ct.level + 1]) + 0.5)
 
@@ -2265,6 +2266,73 @@ class ckks_engine:
             self.ntt.reduce_2q(new_data[i], ct.level)
 
         return self.rescale(new_ct)
+
+    def mult_invN_coeff(self, ct):
+        """
+        계수 도메인에서 각 소수 q_i에 대해 (coeff * (N^{-1} mod q_i)) mod q_i 를 수행.
+        - CKKS 스케일 논리/리스케일과는 무관 (실수-슬롯 의미 X).
+        - ct의 ntt_state/montgomery_state 플래그는 유지.
+        - 내부에서 pow(N, -1, q_i)로 역원 계산.
+        """
+        # 기본 파라미터
+        N = int(self.ctx.N)
+        q_list = [int(q) for q in self.ctx.q]
+        level = ct.level
+        include_special = ct.include_special
+        mult_type = -2 if include_special else -1  # 라이브러리 관례
+
+        # 1) (권장) 잔여 정규화: 음수표현/2q 초과 등 정리
+        for comp in ct.data:
+            self.ntt.make_unsigned(comp, level, mult_type)
+            self.ntt.reduce_2q(    comp, level, mult_type)
+
+        # 2) 각 소수 q_i에 대해 invN_i = N^{-1} (mod q_i) 계산 (pow의 모듈러 역원)
+        invN_list = [pow(N % qi, -1, qi) for qi in q_list]  # N과 qi는 서로소(보통 qi≡1 mod 2N)
+
+        # 3) Montgomery 상수로 변환: invN_i * R (mod q_i)
+        R = int(self.ctx.R)
+        mont_scalars = [ (invN * R) % qi for invN, qi in zip(invN_list, q_list) ]
+
+        # 4) 활성 소수 인덱스 분할(디바이스 파티셔닝)에 맞춰 스칼라 분배
+        dest = self.ntt.p.destination_arrays[level]  # 각 디바이스가 담당하는 limb 인덱스
+        part = [[mont_scalars[i] for i in dest_i] for dest_i in dest]
+        tensors = [
+            torch.tensor(p, dtype=self.ctx.torch_dtype, device=self.ntt.devices[d])
+            for d, p in enumerate(part)
+        ]
+
+        # 5) 각 컴포넌트(c0, c1)에 대해 계수별 곱 (Montgomery 스칼라 곱)
+        new_ct = self.clone(ct)
+        for comp_idx in (0, 1):
+            self.ntt.mont_enter_scalar(new_ct.data[comp_idx], tensors, level)
+            self.ntt.reduce_2q(      new_ct.data[comp_idx], level, mult_type)
+
+        # 6) 리스케일/스케일 변경 없음. 플래그 유지.
+        return new_ct
+
+    def negate_coeff(self, ct):
+        """
+        계수 도메인에서 ct에 -1을 곱한다.
+        - 스케일/레벨 변화 없음 (depth 소비 X)
+        - NTT/Montgomery 상태 그대로 유지
+        - 부호 반전 뒤 [0, 2q) 범위로 정규화
+        """
+        level = ct.level
+        include_special = ct.include_special
+        mult_type = -2 if include_special else -1
+
+        new_ct = self.clone(ct)
+        # c0, c1 각 컴포넌트의 모든 RNS limb 텐서에 대해 부호 반전
+        for comp in new_ct.data:
+            for chunk in comp:
+                chunk.neg_()  # 텐서 원소별로 -1 곱
+
+            # 모듈러 정규화: [0, 2q)로 맞춰 다음 연산에서 안전하게 사용
+            self.ntt.make_unsigned(comp, level, mult_type)
+            self.ntt.reduce_2q(    comp, level, mult_type)
+
+        return new_ct
+
 
     def add_scalar(self, ct, scalar):
         device_len = len(ct.data[0])

@@ -306,18 +306,14 @@ def encode(m, rng=None, scale=2 ** 40, deviation=1.0,
     else:
         pre_perm, post_perm = prepost_perms(N, device=device)
         perm_cache[(N, device)] = (pre_perm, post_perm)
-        
-    # print("m:", m)
-    mm = torch.from_numpy(np.array(m * deviation, dtype = np.float64)).to(device)  # check dtype m * deviation
-    # print("mm:", mm)
 
+    
+    mm = torch.from_numpy(np.array(m * deviation, dtype = np.float64)).to(device)  # check dtype m * deviation
 
     if coeff:
-        # print("return:", rng.randround(mm * np.float64(scale)))
         return rng.randround(mm * np.float64(scale))
     
     mm = pre_permute(mm, pre_perm)
-    # print("mm:", mm)
     
     if (N, device) in twister_cache.keys():
         twister = twister_cache[N, device]
@@ -337,10 +333,9 @@ def decode(m, scale=2 ** 40,
            return_without_scaling=False, coeff=False):
     N = len(m)
     
+    
     if coeff:
         mm = m / scale * correction
-        # mm = post_permute(mm, post_perm)
-        # print("post permute mm:", mm)
         return mm
 
     
